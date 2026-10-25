@@ -1,12 +1,13 @@
-# Design note — Part 1: capacity by role; Part 2: ordering by type
+# Design note — Parts 1–3
 
-Status: Parts 1–2 implemented. Part 3 (urgent reruns) later.
+Status: Parts 1–3 implemented (capacity by role, ordering by
+type, urgent reruns).
 
 ## Job lifecycle and what counts where
 
 | Stage | Meaning | Counts as |
 | --- | --- | --- |
-| waiting | accepted, in a per-(role, type) FIFO queue | rerun demand (if rerun) |
+| waiting | accepted, in a per-(role, urgent, type) FIFO queue | rerun demand (if rerun) |
 | running | claimed by a worker until its function returns | one slot; rerun demand (if rerun) |
 | done | function returned or raised | nothing |
 
@@ -37,14 +38,12 @@ waiting rerun's slot.
   below `running_live`; no new live job starts, the next freed
   slot goes to the rerun, and live re-expands as rerun work
   drains. Capacity moves only at claim time; nothing is preempted.
-- **C6** — if a waiting rerun cannot start, `running_rerun =
-  rerun_max`, so demand equals `running_rerun` and live jobs can
-  fill every remaining slot. If a live job is blocked by
-  `live_cap`, demand exceeds `running_rerun`, so a rerun is
-  waiting below its cap and is eligible. Some waiting job is
-  therefore always eligible for a free slot, and workers re-check
-  on every submit and finish. **C7**: workers block on a
-  `Condition`; no polling.
+- **C6** — if a waiting rerun cannot start, demand equals
+  `running_rerun`, so live jobs can fill every remaining slot;
+  if a live job is blocked by `live_cap`, a rerun is waiting
+  below its cap and is eligible. Some waiting job is always
+  eligible for a free slot, re-checked on every submit/finish.
+  **C7**: workers block on a `Condition`; no polling.
 
 Rejected: static partition (C3); always reserving `rerun_max`
 (S3/C6); preemption (C5); paired semaphores, which cannot check
@@ -53,10 +52,11 @@ total, role cap, and demand atomically — the one lock can.
 ## Structure and ordering
 
 `total` worker threads share all work (a per-role pool would
-partition capacity, violating C3). Picking is two steps: role
+partition capacity, violating C3). Picking is ordered: role
 first (capacity; rerun before live per C4, with `live_cap` — not
-check order — enforcing the cap), then type within the role,
-comparing only the two queue heads:
+check order — enforcing the cap), then urgency within reruns
+(Part 3, below), then type within the chosen tier, comparing
+only the two queue heads:
 
 - quick beats full (O1), unless the full job has waited at least
   `starvation_after` seconds (K). Such a job is *promoted* into
@@ -64,13 +64,11 @@ comparing only the two queue heads:
 - If only one queue is non-empty, its head runs.
 
 O2 holds because, once promoted, a full job can only be preceded
-by quick jobs submitted *before* it — a finite set, fixed at its
-submission and only shrinking. No newly arriving quick job can
-overtake it, so its wait is bounded by those earlier jobs plus
-the running ones. Reversed, the same argument protects quick
-jobs from promoted full jobs submitted after them: neither type
-starves. Comparing heads is sound since the head full job is the
-oldest of its role; if unpromoted, all behind it are too.
+by quick jobs submitted *before* it — a finite, shrinking set.
+No newly arriving quick job can overtake it; reversed, the same
+argument protects quick jobs. Neither type starves. Comparing
+heads is sound since the head full job is the oldest of its
+tier; if unpromoted, all behind it are too.
 
 Aging is evaluated at pick time (`clock() - enqueued_at >= K`),
 so no timer wakeup is needed: aging only reorders waiting jobs,
@@ -83,9 +81,36 @@ fake clock. Cross-role, ordering remains capacity-driven (O1
 allows this); aging is within-role only, as Part 1 already
 guarantees each role its slots.
 
+## Urgent reruns (Part 3)
+
+Urgency is an ordering rule, not a capacity rule. `urgent=True`
+is accepted only for reruns. It changes no accounting: urgent
+jobs count exactly like normal ones in `rerun_demand`,
+`running_rerun`, and `total`, at every lifecycle stage; nothing
+is preempted. Live-vs-rerun selection is unchanged.
+
+Within reruns, the urgent tier is picked before the normal tier,
+with one bound: at most **three** consecutive urgent claims
+while a normal rerun is waiting; the next rerun claim must then
+be normal, and the streak resets. (The streak counts only
+urgent claims made while a normal rerun was actually waiting,
+and is held under the lock.) So while both tiers wait, normal
+reruns get at least one in every four rerun claims — progress
+is guaranteed in claim counts, regardless of arrival rates —
+while urgent work still gets up to three quarters of rerun
+claims and starts sooner. Within each tier, Part 2 type
+ordering and aging apply unchanged; aging does not cross tiers,
+and the burst bound caps the extra delay that can cause.
+
+Rejected: strict urgent priority, which starves normal reruns
+under a sustained urgent stream. Also rejected: reserving
+capacity for urgent reruns (splitting `rerun_max`), which
+wastes slots when no urgent work exists.
+
 Complexity, for n waiting jobs: submit and pick are O(1) in n
-(deque append; two heads; no heap, since queues are already in
-submission order). One qualification: submit's `notify_all()`
+(deque append; queue heads and `len()` tier counts; no heap,
+since queues are already in submission order). One
+qualification: submit's `notify_all()`
 can wake up to `total` workers, so its wall-clock cost is
 O(total) — a small fixed pool size, independent of n. Memory is
 O(active jobs): queues plus a set of in-flight job ids, each id
@@ -118,9 +143,9 @@ released when its job finishes.
 
 ## Deliberately left out
 
-Part 3 urgent reruns; result/error delivery (jobs record their
-own outcomes); cancellation, timeouts, retries, persistence
-(out of scope per the assignment).
+Result/error delivery (jobs record their own outcomes);
+cancellation, timeouts, retries, persistence (out of scope per
+the assignment).
 
 ## Multi-process / distributed
 

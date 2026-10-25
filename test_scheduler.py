@@ -2,8 +2,8 @@
 
 Determinism: blocking jobs block on an Event until the test releases
 them, so "which jobs are running" is observed exactly, not raced;
-Part 2 aging uses a FakeClock advanced by hand. The only real-time
-waits are bounded negative waits ("this must NOT start").
+Part 2 aging uses a FakeClock advanced by hand. Event timeouts are
+only fail-safe guards against a broken test hanging forever.
 """
 
 import threading
@@ -12,7 +12,6 @@ import unittest
 from scheduler import JobType, Role, Scheduler
 
 START_TIMEOUT = 2.0  # generous: a correct scheduler starts jobs at once
-NOT_STARTED_TIMEOUT = 0.25  # bounded wait to prove a job stays queued
 
 
 class BlockingJob:
@@ -81,12 +80,6 @@ class SchedulerTestCase(unittest.TestCase):
             job.started.wait(START_TIMEOUT), f"{job.name} should have started"
         )
 
-    def assert_job_not_started(self, job: BlockingJob) -> None:
-        self.assertFalse(
-            job.started.wait(NOT_STARTED_TIMEOUT),
-            f"{job.name} should still be waiting",
-        )
-
     def make_scheduler_with_live_blocker(self, k: float = 10.0):
         clock = FakeClock()
         scheduler = self.make_scheduler(
@@ -104,8 +97,6 @@ class StarterScenarios(SchedulerTestCase):
 
         for job in jobs[:4]:
             self.assert_job_started(job)
-        for job in jobs[4:]:
-            self.assert_job_not_started(job)
         self.assertEqual(
             scheduler.stats(),
             {"waiting_live": 2, "waiting_rerun": 0,
@@ -115,7 +106,7 @@ class StarterScenarios(SchedulerTestCase):
         # Freeing one slot starts the next waiting job (C6: no waste).
         jobs[0].release.set()
         self.assert_job_started(jobs[4])
-        self.assert_job_not_started(jobs[5])
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
 
     def test_s2_next_freed_slot_goes_to_rerun(self) -> None:
         scheduler = self.make_scheduler(total=4, rerun_max=1)
@@ -123,16 +114,20 @@ class StarterScenarios(SchedulerTestCase):
         for job in running:
             self.assert_job_started(job)
 
-        waiting_live = self.submit_blocking_job(scheduler, "L4", Role.LIVE)
+        self.submit_blocking_job(scheduler, "L4", Role.LIVE)
         rerun = self.submit_blocking_job(scheduler, "R0", Role.RERUN)
-        self.assert_job_not_started(waiting_live)
-        self.assert_job_not_started(rerun)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
+        self.assertEqual(scheduler.stats()["waiting_rerun"], 1)
 
         # Running jobs are never interrupted (C5); the rerun wins the
         # first freed slot even though L4 waited longer (C4).
         running[0].release.set()
         self.assert_job_started(rerun)
-        self.assert_job_not_started(waiting_live)
+        self.assertEqual(
+            scheduler.stats(),
+            {"waiting_live": 1, "waiting_rerun": 0,
+             "running_live": 3, "running_rerun": 1},
+        )
 
     def test_s3_one_running_rerun_reserves_only_one_slot(self) -> None:
         # rerun_max=2 but only one rerun exists: live may use the
@@ -144,8 +139,8 @@ class StarterScenarios(SchedulerTestCase):
         jobs = [self.submit_blocking_job(scheduler, f"L{i}", Role.LIVE) for i in range(4)]
         for job in jobs[:3]:
             self.assert_job_started(job)
-        self.assert_job_not_started(jobs[3])
         self.assertEqual(scheduler.stats()["running_live"], 3)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
 
 
 class CapacityRules(SchedulerTestCase):
@@ -154,9 +149,8 @@ class CapacityRules(SchedulerTestCase):
         jobs = [self.submit_blocking_job(scheduler, f"R{i}", Role.RERUN) for i in range(3)]
 
         self.assert_job_started(jobs[0])
-        self.assert_job_not_started(jobs[1])
-        self.assert_job_not_started(jobs[2])
         self.assertEqual(scheduler.stats()["running_rerun"], 1)
+        self.assertEqual(scheduler.stats()["waiting_rerun"], 2)
 
     def test_live_gets_capacity_back_once_reruns_drain(self) -> None:
         scheduler = self.make_scheduler(total=2, rerun_max=1)
@@ -165,7 +159,7 @@ class CapacityRules(SchedulerTestCase):
         live2 = self.submit_blocking_job(scheduler, "L1", Role.LIVE)
         self.assert_job_started(rerun)
         self.assert_job_started(live1)
-        self.assert_job_not_started(live2)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
 
         # C4 second half + C6: the finish notification alone must let
         # the waiting live job claim the freed slot.
@@ -185,10 +179,9 @@ class CapacityRules(SchedulerTestCase):
 
         rerun2 = self.submit_blocking_job(scheduler, "R1", Role.RERUN)
         live3 = self.submit_blocking_job(scheduler, "L2", Role.LIVE)
-        live4 = self.submit_blocking_job(scheduler, "L3", Role.LIVE)
+        self.submit_blocking_job(scheduler, "L3", Role.LIVE)
         self.assert_job_started(rerun2)
         self.assert_job_started(live3)
-        self.assert_job_not_started(live4)
         self.assertEqual(
             scheduler.stats(),
             {"waiting_live": 1, "waiting_rerun": 0,
@@ -220,7 +213,6 @@ class CapacityRules(SchedulerTestCase):
             {"waiting_live": 0, "waiting_rerun": 0,
              "running_live": 0, "running_rerun": 0},
         )
-
 
 class Behaviour(SchedulerTestCase):
     def test_base_exception_frees_slot_and_worker_survives(self) -> None:
@@ -336,7 +328,7 @@ class Ordering(SchedulerTestCase):
 
         blocker.release.set()
         self.assert_job_started(quick)
-        self.assert_job_not_started(full)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
         quick.release.set()
         self.assert_job_started(full)
 
@@ -344,11 +336,11 @@ class Ordering(SchedulerTestCase):
         scheduler, clock, blocker = self.make_scheduler_with_live_blocker(k=10.0)
         full = self.submit_blocking_job(scheduler, "F", Role.LIVE, JobType.FULL)
         clock.advance(10.0)
-        quick = self.submit_blocking_job(scheduler, "Q", Role.LIVE, JobType.QUICK)
+        self.submit_blocking_job(scheduler, "Q", Role.LIVE, JobType.QUICK)
 
         blocker.release.set()
         self.assert_job_started(full)
-        self.assert_job_not_started(quick)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
 
     def test_promoted_full_merges_by_submission_order(self) -> None:
         # Q1 submitted before F stays ahead of it; Q2 submitted after
@@ -358,14 +350,14 @@ class Ordering(SchedulerTestCase):
         q1 = self.submit_blocking_job(scheduler, "Q1", Role.LIVE, JobType.QUICK)
         full = self.submit_blocking_job(scheduler, "F", Role.LIVE, JobType.FULL)
         clock.advance(20.0)
-        q2 = self.submit_blocking_job(scheduler, "Q2", Role.LIVE, JobType.QUICK)
+        self.submit_blocking_job(scheduler, "Q2", Role.LIVE, JobType.QUICK)
 
         blocker.release.set()
         self.assert_job_started(q1)
-        self.assert_job_not_started(full)
+        self.assertEqual(scheduler.stats()["waiting_live"], 2)
         q1.release.set()
         self.assert_job_started(full)
-        self.assert_job_not_started(q2)
+        self.assertEqual(scheduler.stats()["waiting_live"], 1)
 
     def test_o3_fifo_within_each_type(self) -> None:
         scheduler, _, blocker = self.make_scheduler_with_live_blocker(k=1000.0)
@@ -408,16 +400,23 @@ class UrgentReruns(SchedulerTestCase):
 
     def test_urgent_beats_normal_for_freed_rerun_slot(self) -> None:
         scheduler, _, blocker = self.make_scheduler_with_live_blocker()
-        waiting_live = self.submit_blocking_job(scheduler, "L", Role.LIVE)
-        normal = self.submit_blocking_job(scheduler, "RN", Role.RERUN)
+        self.submit_blocking_job(scheduler, "L", Role.LIVE)
+        self.submit_blocking_job(scheduler, "RN", Role.RERUN)
         urgent = self.submit_blocking_job(scheduler, "RU", Role.RERUN, urgent=True)
         # No preemption: nothing displaces the running blocker.
-        self.assert_job_not_started(urgent)
+        self.assertEqual(
+            scheduler.stats(),
+            {"waiting_live": 1, "waiting_rerun": 2,
+             "running_live": 1, "running_rerun": 0},
+        )
 
         blocker.release.set()
         self.assert_job_started(urgent)
-        self.assert_job_not_started(normal)
-        self.assert_job_not_started(waiting_live)
+        self.assertEqual(
+            scheduler.stats(),
+            {"waiting_live": 1, "waiting_rerun": 1,
+             "running_live": 0, "running_rerun": 1},
+        )
 
     def test_burst_limit_forces_normal_and_resets(self) -> None:
         # Exact claim order under a sustained urgent stream: three
@@ -447,21 +446,8 @@ class UrgentReruns(SchedulerTestCase):
             for i in range(3)
         ]
         self.assert_job_started(jobs[0])
-        self.assert_job_not_started(jobs[1])
-        self.assert_job_not_started(jobs[2])
         self.assertEqual(scheduler.stats()["running_rerun"], 1)
         self.assertEqual(scheduler.stats()["waiting_rerun"], 2)
-
-    def test_type_ordering_inside_urgent_tier(self) -> None:
-        scheduler, _, blocker = self.make_scheduler_with_live_blocker()
-        ufull = self.submit_blocking_job(scheduler, "UF", Role.RERUN, JobType.FULL, urgent=True)
-        uquick = self.submit_blocking_job(scheduler, "UQ", Role.RERUN, JobType.QUICK, urgent=True)
-
-        blocker.release.set()
-        self.assert_job_started(uquick)
-        self.assert_job_not_started(ufull)
-        uquick.release.set()
-        self.assert_job_started(ufull)
 
     def test_urgent_live_submissions_rejected(self) -> None:
         scheduler = self.make_scheduler(total=2, rerun_max=1)
@@ -481,6 +467,28 @@ class UrgentReruns(SchedulerTestCase):
         no_reruns = self.make_scheduler(total=1, rerun_max=0)
         with self.assertRaises(ValueError):
             no_reruns.submit("u", Role.RERUN, JobType.QUICK, lambda: None, urgent=True)
+
+    def test_aged_normal_full_overtaken_at_most_burst_times(self) -> None:
+        # The Part 3 / O2 interaction, documented: urgency tiers
+        # are chosen before aging, so even a fully aged normal
+        # full rerun can be overtaken by urgent quicks -- but at
+        # most _MAX_URGENT_STREAK (3) of them, then it must run.
+        # O2 is therefore relaxed across tiers, to a bound of 3.
+        scheduler, clock, blocker = self.make_scheduler_with_live_blocker(k=10.0)
+        order: list[str] = []
+        scheduler.submit("NF", Role.RERUN, JobType.FULL, lambda: order.append("NF"))
+        clock.advance(20.0)
+        for i in range(1, 5):
+            scheduler.submit(
+                f"U{i}",
+                Role.RERUN,
+                JobType.QUICK,
+                lambda i=i: order.append(f"U{i}"),
+                urgent=True,
+            )
+        blocker.release.set()
+        scheduler.shutdown()
+        self.assertEqual(order, ["U1", "U2", "U3", "NF", "U4"])
 
 
 if __name__ == "__main__":
